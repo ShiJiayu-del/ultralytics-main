@@ -6,6 +6,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import importlib
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
@@ -45,6 +46,7 @@ __all__ = (
     "HGBlock",
     "HGStem",
     "ImagePoolingAttn",
+    "PIDDualBranchFusion",
     "Proto",
     "RepC3",
     "RepNCSPELAN4",
@@ -235,6 +237,160 @@ class SPPF(nn.Module):
         y.extend(self.m(y[-1]) for _ in range(getattr(self, "n", 3)))
         y = self.cv2(torch.cat(y, 1))
         return y + x if getattr(self, "add", False) else y
+
+
+class PIDDualBranchFusion(nn.Module):
+    """PID-inspired dual-branch fusion block.
+
+    The visual branch keeps standard convolutional features while the physical branch predicts emissivity/temperature
+    decomposition cues. A temperature-gradient map guides visual features before fusion.
+    """
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        phy_channels: int = 128,
+        vnums: int = 4,
+        guide_scale: float = 0.5,
+        use_external_tevnet: bool = False,
+        smp_model: str = "PAN",
+        smp_encoder: str = "resnet50",
+        smp_encoder_weights: str | None = "imagenet",
+        tev_ckpt: str | None = None,
+        tev_freeze: bool = True,
+    ):
+        """Initialize dual-branch fusion module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            phy_channels (int): Hidden channels for physical branch.
+            vnums (int): Number of environment/material channels in TeV decomposition.
+            guide_scale (float): Scaling factor for temperature-gradient guidance.
+        """
+        super().__init__()
+        self.vnums = max(int(vnums), 1)
+        self.guide_scale = float(guide_scale)
+
+        self.vis_proj = Conv(c1, c2, k=3, s=1)
+        if use_external_tevnet:
+            self.phy_branch = ExternalTeVPhysicsBranch(
+                c1=c1,
+                vnums=self.vnums,
+                smp_model=smp_model,
+                smp_encoder=smp_encoder,
+                smp_encoder_weights=smp_encoder_weights,
+                tev_ckpt=tev_ckpt,
+                tev_freeze=tev_freeze,
+            )
+            phy_feat_channels = 2 + self.vnums
+        else:
+            self.phy_branch = nn.Sequential(
+                Conv(c1, phy_channels, k=3, s=1),
+                Conv(phy_channels, phy_channels, k=3, s=1),
+            )
+            self.tev_head = nn.Conv2d(phy_channels, 2 + self.vnums, kernel_size=1, stride=1, padding=0)
+            phy_feat_channels = phy_channels
+        self.fuse = Conv(c2 + phy_feat_channels, c2, k=1, s=1)
+
+        # Cached by forward() for loss and post-processing access.
+        self.latest_phy = None
+
+    @staticmethod
+    def _temperature_grad_map(t: torch.Tensor) -> torch.Tensor:
+        """Compute normalized Sobel gradient magnitude map."""
+        kx = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], device=t.device, dtype=t.dtype)
+        ky = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], device=t.device, dtype=t.dtype)
+        kx = kx.view(1, 1, 3, 3)
+        ky = ky.view(1, 1, 3, 3)
+        gx = F.conv2d(t, kx, padding=1)
+        gy = F.conv2d(t, ky, padding=1)
+        grad = torch.sqrt(gx.square() + gy.square() + 1e-6)
+        return grad / (grad.amax(dim=(2, 3), keepdim=True) + 1e-6)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward with visual-physical fusion and guidance."""
+        vis_feat = self.vis_proj(x)
+        phy_feat = self.phy_branch(x)
+        tev = phy_feat if phy_feat.shape[1] == 2 + self.vnums else self.tev_head(phy_feat)
+        emissivity = tev[:, 0:1].sigmoid()
+        temperature = tev[:, 1:2].relu()
+        env_feat = tev[:, 2:]
+
+        temp_grad = self._temperature_grad_map(temperature)
+        vis_guided = vis_feat * (1.0 + self.guide_scale * temp_grad)
+        out = self.fuse(torch.cat((vis_guided, phy_feat), dim=1))
+
+        self.latest_phy = {"e": emissivity, "t": temperature, "v": env_feat, "grad": temp_grad}
+        return out
+
+
+class ExternalTeVPhysicsBranch(nn.Module):
+    """Optional TeVNet-style physical branch backed by segmentation_models_pytorch."""
+
+    def __init__(
+        self,
+        c1: int,
+        vnums: int = 4,
+        smp_model: str = "PAN",
+        smp_encoder: str = "resnet50",
+        smp_encoder_weights: str | None = "imagenet",
+        tev_ckpt: str | None = None,
+        tev_freeze: bool = True,
+    ):
+        super().__init__()
+        try:
+            smp = importlib.import_module("segmentation_models_pytorch")
+        except ImportError as exc:
+            raise ImportError(
+                "External TeVNet branch requires segmentation_models_pytorch. Install it or set use_external_tevnet=False."
+            ) from exc
+
+        if smp_encoder_weights in {"None", "none", "null", "NULL", ""}:
+            smp_encoder_weights = None
+        self.model = getattr(smp, smp_model)(
+            encoder_name=smp_encoder,
+            encoder_weights=smp_encoder_weights,
+            in_channels=c1,
+            classes=2 + vnums,
+        )
+
+        if tev_ckpt not in {None, "None", "none", "null", "NULL", ""}:
+            self._load_from_checkpoint(tev_ckpt)
+
+        if tev_freeze:
+            for param in self.model.parameters():
+                param.requires_grad = False
+            self.model.eval()
+
+    def _load_from_checkpoint(self, tev_ckpt: str) -> None:
+        """Load a PID-style checkpoint while tolerating DataParallel and nested state dict formats."""
+        ckpt = torch.load(tev_ckpt, map_location="cpu")
+        if isinstance(ckpt, dict):
+            state_dict = ckpt.get("state_dict", ckpt.get("model", ckpt))
+        else:
+            state_dict = ckpt
+
+        if hasattr(state_dict, "state_dict"):
+            state_dict = state_dict.state_dict()
+
+        normalized = {}
+        for key, value in state_dict.items():
+            new_key = key
+            for prefix in ("module.", "model.", "tevnet."):
+                if new_key.startswith(prefix):
+                    new_key = new_key[len(prefix) :]
+            normalized[new_key] = value
+
+        missing, unexpected = self.model.load_state_dict(normalized, strict=False)
+        self._load_warnings = {"missing": missing, "unexpected": unexpected}
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        preds = self.model(x)
+        preds[:, 0:1] = preds[:, 0:1].sigmoid()
+        preds[:, 1:2] = preds[:, 1:2].relu()
+        return preds
 
 
 class C1(nn.Module):

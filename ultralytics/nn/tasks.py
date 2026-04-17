@@ -57,6 +57,7 @@ from ultralytics.nn.modules import (
     LRPCHead,
     Pose,
     Pose26,
+    PIDDualBranchFusion,
     RepC3,
     RepConv,
     RepNCSPELAN4,
@@ -78,6 +79,7 @@ from ultralytics.utils.checks import check_requirements, check_suffix, check_yam
 from ultralytics.utils.loss import (
     E2ELoss,
     PoseLoss26,
+    PIDPhysicsDetectionLoss,
     v8ClassificationLoss,
     v8DetectionLoss,
     v8OBBLoss,
@@ -171,6 +173,7 @@ class BaseModel(torch.nn.Module):
             (torch.Tensor): The last output of the model.
         """
         y, dt, embeddings = [], [], []  # outputs
+        pid_aux = None
         embed = frozenset(embed) if embed is not None else {-1}
         max_idx = max(embed)
         for m in self.model:
@@ -179,13 +182,17 @@ class BaseModel(torch.nn.Module):
             if profile:
                 self._profile_one_layer(m, x, dt)
             x = m(x)  # run
+            if hasattr(m, "latest_phy") and m.latest_phy is not None:
+                pid_aux = m.latest_phy
             y.append(x if m.i in self.save else None)  # save output
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
             if m.i in embed:
                 embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
                 if m.i == max_idx:
+                    self._pid_aux = pid_aux
                     return torch.unbind(torch.cat(embeddings, 1), dim=0)
+        self._pid_aux = pid_aux
         return x
 
     def _predict_augment(self, x):
@@ -511,7 +518,10 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
-        return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        if getattr(self, "end2end", False):
+            return E2ELoss(self)
+        pid_enable = getattr(self.args, "pid_enable", False) or any(hasattr(m, "latest_phy") for m in self.model)
+        return PIDPhysicsDetectionLoss(self) if pid_enable else v8DetectionLoss(self)
 
 
 class OBBModel(DetectionModel):
@@ -1608,6 +1618,7 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
+            PIDDualBranchFusion,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments

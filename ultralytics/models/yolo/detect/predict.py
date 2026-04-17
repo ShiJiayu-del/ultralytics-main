@@ -64,6 +64,38 @@ class DetectionPredictor(BasePredictor):
             return_idxs=save_feats,
         )
 
+        if getattr(self.args, "pid_nms_enable", False):
+            thermal_maps, emissivity_maps = self._get_pid_maps_from_model()
+            if save_feats:
+                filtered_preds = nms.apply_physical_nms(
+                    preds[0],
+                    thermal_maps=thermal_maps,
+                    emissivity_maps=emissivity_maps,
+                    img_tensor=img,
+                    conf_thres=self.args.conf,
+                    pedestrian_class=getattr(self.args, "pid_pedestrian_class", 0),
+                    vehicle_class=getattr(self.args, "pid_vehicle_class", 1),
+                    ped_temp_ratio=getattr(self.args, "pid_ped_temp_ratio", 0.90),
+                    ped_emissivity_min=getattr(self.args, "pid_ped_emissivity_min", 0.05),
+                    vehicle_hot_ratio=getattr(self.args, "pid_vehicle_hot_ratio", 1.05),
+                    vehicle_conf_decay=getattr(self.args, "pid_vehicle_conf_decay", 0.9),
+                )
+                preds = (filtered_preds, preds[1])
+            else:
+                preds = nms.apply_physical_nms(
+                    preds,
+                    thermal_maps=thermal_maps,
+                    emissivity_maps=emissivity_maps,
+                    img_tensor=img,
+                    conf_thres=self.args.conf,
+                    pedestrian_class=getattr(self.args, "pid_pedestrian_class", 0),
+                    vehicle_class=getattr(self.args, "pid_vehicle_class", 1),
+                    ped_temp_ratio=getattr(self.args, "pid_ped_temp_ratio", 0.90),
+                    ped_emissivity_min=getattr(self.args, "pid_ped_emissivity_min", 0.05),
+                    vehicle_hot_ratio=getattr(self.args, "pid_vehicle_hot_ratio", 1.05),
+                    vehicle_conf_decay=getattr(self.args, "pid_vehicle_conf_decay", 0.9),
+                )
+
         if not isinstance(orig_imgs, list):  # input images are a torch.Tensor, not a list
             orig_imgs = ops.convert_torch2numpy_batch(orig_imgs)[..., ::-1]
 
@@ -78,6 +110,20 @@ class DetectionPredictor(BasePredictor):
                 r.feats = f  # add object features to results
 
         return results
+
+    def _get_pid_maps_from_model(self):
+        """Resolve cached PID maps from wrapped model objects."""
+        candidates = [self.model, getattr(self.model, "model", None)]
+        if getattr(self.model, "model", None) is not None:
+            candidates.append(getattr(self.model.model, "model", None))
+
+        for holder in candidates:
+            if holder is None:
+                continue
+            pid_aux = getattr(holder, "_pid_aux", None)
+            if isinstance(pid_aux, dict):
+                return pid_aux.get("t", None), pid_aux.get("e", None)
+        return None, None
 
     @staticmethod
     def get_obj_feats(feat_maps, idxs):

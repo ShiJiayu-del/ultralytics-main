@@ -68,6 +68,13 @@ agnostic_nms: False # (bool) class-agnostic NMS
 classes: # (int | list[int], optional) filter by class id(s), e.g. 0 or [0,2,3]
 retina_masks: False # (bool) use high-resolution segmentation masks (segment)
 embed: # (list[int], optional) return feature embeddings from given layer indices
+pid_nms_enable: False # (bool) enable physics-aware NMS post-filtering
+pid_pedestrian_class: 0 # (int) class id used as pedestrian in physical NMS rules
+pid_vehicle_class: 1 # (int) class id used as vehicle in physical NMS rules
+pid_ped_temp_ratio: 0.9 # (float) pedestrian mean-temperature must be >= bg * ratio
+pid_ped_emissivity_min: 0.05 # (float) minimum pedestrian emissivity prior in physical NMS
+pid_vehicle_hot_ratio: 1.05 # (float) vehicle hotspot threshold relative to background mean
+pid_vehicle_conf_decay: 0.9 # (float) confidence decay for vehicles without hotspot evidence
 
 # Visualize settings ---------------------------------------------------------------------------------------------------
 show: False # (bool) show images/videos in a window if supported
@@ -132,3 +139,8 @@ cfg: # (str, optional) path to a config.yaml that overrides defaults
 
 # Tracker settings ------------------------------------------------------------------------------------------------------
 tracker: botsort.yaml # (str) tracker config file: botsort.yaml or bytetrack.yaml
+
+# PID physical priors -------------------------------------------------------------------------------------------------
+pid_enable: False # (bool) enable PID-inspired physical regularization during detection training
+pid_lambda_consist: 0.1 # (float) weight for TeV reconstruction consistency loss
+pid_lambda_align: 0.05 # (float) weight for class-conditional physical alignment loss

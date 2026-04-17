@@ -166,6 +166,100 @@ def non_max_suppression(
     return (output, keepi) if return_idxs else output
 
 
+def apply_physical_nms(
+    detections,
+    thermal_maps: torch.Tensor | None = None,
+    emissivity_maps: torch.Tensor | None = None,
+    img_tensor: torch.Tensor | None = None,
+    *,
+    conf_thres: float = 0.25,
+    pedestrian_class: int = 0,
+    vehicle_class: int = 1,
+    ped_temp_ratio: float = 0.90,
+    ped_emissivity_min: float = 0.05,
+    vehicle_hot_ratio: float = 1.05,
+    vehicle_conf_decay: float = 0.9,
+):
+    """Apply physics-aware filtering on top of standard NMS detections.
+
+    This function expects detections in xyxy + conf + cls format per image.
+    """
+
+    if thermal_maps is None and img_tensor is None:
+        return detections
+
+    if thermal_maps is not None and thermal_maps.ndim == 3:
+        thermal_maps = thermal_maps.unsqueeze(1)
+    if emissivity_maps is not None and emissivity_maps.ndim == 3:
+        emissivity_maps = emissivity_maps.unsqueeze(1)
+
+    out = []
+    for i, det in enumerate(detections):
+        if det is None or len(det) == 0:
+            out.append(det)
+            continue
+
+        if thermal_maps is not None and i < thermal_maps.shape[0]:
+            t_map = thermal_maps[i, 0]
+        elif img_tensor is not None and i < img_tensor.shape[0]:
+            t_map = img_tensor[i].mean(0)
+        else:
+            out.append(det)
+            continue
+
+        e_map = None
+        if emissivity_maps is not None and i < emissivity_maps.shape[0]:
+            e_map = emissivity_maps[i, 0]
+            if e_map.shape != t_map.shape:
+                e_map = torch.nn.functional.interpolate(
+                    e_map[None, None], size=t_map.shape[-2:], mode="bilinear", align_corners=False
+                )[0, 0]
+
+        h, w = t_map.shape
+        bg_temp = t_map.mean()
+        kept_rows = []
+        for row in det:
+            x1, y1, x2, y2, conf, cls_id = row[:6]
+            ix1 = max(0, min(int(torch.floor(x1).item()), w - 1))
+            iy1 = max(0, min(int(torch.floor(y1).item()), h - 1))
+            ix2 = max(ix1 + 1, min(int(torch.ceil(x2).item()), w))
+            iy2 = max(iy1 + 1, min(int(torch.ceil(y2).item()), h))
+
+            roi_t = t_map[iy1:iy2, ix1:ix2]
+            if roi_t.numel() == 0:
+                continue
+            t_mean = roi_t.mean()
+
+            roi_e_mean = None
+            if e_map is not None:
+                roi_e = e_map[iy1:iy2, ix1:ix2]
+                if roi_e.numel() > 0:
+                    roi_e_mean = roi_e.mean()
+
+            keep = True
+            cls_int = int(cls_id.item())
+            if cls_int == pedestrian_class:
+                if t_mean < bg_temp * ped_temp_ratio:
+                    keep = False
+                if roi_e_mean is not None and roi_e_mean < ped_emissivity_min:
+                    keep = False
+            elif cls_int == vehicle_class:
+                hot_ratio = (roi_t > (bg_temp * vehicle_hot_ratio)).float().mean()
+                if hot_ratio < 0.01:
+                    row = row.clone()
+                    row[4] = row[4] * vehicle_conf_decay
+
+            if keep and row[4] >= conf_thres:
+                kept_rows.append(row)
+
+        if kept_rows:
+            out.append(torch.stack(kept_rows, dim=0))
+        else:
+            out.append(det.new_zeros((0, det.shape[1])))
+
+    return out
+
+
 class TorchNMS:
     """Ultralytics custom NMS implementation optimized for YOLO.
 

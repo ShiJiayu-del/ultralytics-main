@@ -634,6 +634,168 @@ class v8SegmentationLoss(v8DetectionLoss):
         return loss / fg_mask.sum()
 
 
+class PIDPhysicsDetectionLoss(v8DetectionLoss):
+    """YOLOv8 detection loss with PID-style physical priors.
+
+    Total loss:
+        L_total = L_det + lambda_1 * L_phy_consist + lambda_2 * L_phy_align
+    """
+
+    def __init__(self, model, tal_topk: int = 10, tal_topk2: int | None = None):
+        """Initialize PID physics-guided detection loss."""
+        super().__init__(model, tal_topk=tal_topk, tal_topk2=tal_topk2)
+        self.det_model = model
+        self.lambda_consist = float(getattr(model.args, "pid_lambda_consist", 0.0))
+        self.lambda_align = float(getattr(model.args, "pid_lambda_align", 0.0))
+
+    @staticmethod
+    def _xywhn_to_xyxy(b: torch.Tensor) -> torch.Tensor:
+        """Convert normalized xywh boxes to normalized xyxy boxes."""
+        x, y, w, h = b.unbind(-1)
+        x1 = x - w / 2
+        y1 = y - h / 2
+        x2 = x + w / 2
+        y2 = y + h / 2
+        return torch.stack((x1, y1, x2, y2), dim=-1)
+
+    @staticmethod
+    def _clamp_box_to_hw(box_xyxy: torch.Tensor, h: int, w: int) -> tuple[int, int, int, int]:
+        """Clamp normalized xyxy box to valid integer crop coordinates."""
+        x1 = int(torch.floor(box_xyxy[0] * w).item())
+        y1 = int(torch.floor(box_xyxy[1] * h).item())
+        x2 = int(torch.ceil(box_xyxy[2] * w).item())
+        y2 = int(torch.ceil(box_xyxy[3] * h).item())
+        x1 = max(0, min(x1, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        x2 = max(x1 + 1, min(x2, w))
+        y2 = max(y1 + 1, min(y2, h))
+        return x1, y1, x2, y2
+
+    @staticmethod
+    def _split_hw(vnums: int) -> tuple[int, int]:
+        """Find a near-square split for environment channels."""
+        hs = int(math.sqrt(vnums))
+        hs = max(hs, 1)
+        while vnums % hs != 0 and hs > 1:
+            hs -= 1
+        ws = max(vnums // hs, 1)
+        return hs, ws
+
+    def _get_pid_aux(self) -> dict[str, torch.Tensor] | None:
+        """Return cached physical outputs produced by PID fusion blocks."""
+        aux = getattr(self.det_model, "_pid_aux", None)
+        if isinstance(aux, dict) and "e" in aux and "t" in aux:
+            return aux
+        return None
+
+    def _physics_consistency_loss(self, aux: dict[str, torch.Tensor], imgs: torch.Tensor) -> torch.Tensor:
+        """TeV reconstruction consistency loss: rec = e*T + (1-e)*env."""
+        e = aux["e"]
+        t = aux["t"]
+        v = aux.get("v", None)
+
+        x_mean = imgs.mean(dim=1, keepdim=True)
+        if x_mean.shape[-2:] != e.shape[-2:]:
+            x_mean = F.interpolate(x_mean, size=e.shape[-2:], mode="bilinear", align_corners=False)
+
+        if v is None or v.shape[1] == 0:
+            env = x_mean
+        else:
+            b, vnums, h, w = v.shape
+            hs, ws = self._split_hw(vnums)
+            x_beta = F.adaptive_avg_pool2d(x_mean, output_size=(hs, ws)).reshape(b, 1, vnums)
+            env = torch.matmul(x_beta, v.reshape(b, vnums, h * w)).reshape(b, 1, h, w)
+
+        rec = e * t + (1.0 - e) * env
+        return F.mse_loss(rec, x_mean)
+
+    def _physics_align_loss(self, aux: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Class-conditional alignment loss on ROI pooled [T, e] features."""
+        if batch["cls"].numel() == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        t_map = aux["t"]
+        e_map = aux["e"]
+        if t_map.shape[-2:] != e_map.shape[-2:]:
+            e_map = F.interpolate(e_map, size=t_map.shape[-2:], mode="bilinear", align_corners=False)
+
+        b, _, h, w = t_map.shape
+        boxes = self._xywhn_to_xyxy(batch["bboxes"].to(self.device).float())
+        boxes = boxes.clamp_(0.0, 1.0)
+        cls = batch["cls"].view(-1).to(self.device).long()
+        img_idx = batch["batch_idx"].view(-1).to(self.device).long()
+
+        feats = []
+        kept_cls = []
+        for i in range(boxes.shape[0]):
+            bi = int(img_idx[i].item())
+            if bi < 0 or bi >= b:
+                continue
+            x1, y1, x2, y2 = self._clamp_box_to_hw(boxes[i], h, w)
+            roi_t = t_map[bi, 0, y1:y2, x1:x2]
+            roi_e = e_map[bi, 0, y1:y2, x1:x2]
+            if roi_t.numel() == 0 or roi_e.numel() == 0:
+                continue
+            feats.append(torch.stack((roi_t.mean(), roi_e.mean()), dim=0))
+            kept_cls.append(cls[i])
+
+        if len(feats) <= 1:
+            return torch.tensor(0.0, device=self.device)
+
+        feats = torch.stack(feats, dim=0)
+        kept_cls = torch.stack(kept_cls, dim=0)
+
+        centers = []
+        intra = torch.tensor(0.0, device=self.device)
+        unique_cls = kept_cls.unique()
+        valid_class_count = 0
+        for c in unique_cls:
+            mask = kept_cls == c
+            if mask.sum() == 0:
+                continue
+            c_feat = feats[mask]
+            c_center = c_feat.mean(dim=0)
+            centers.append(c_center)
+            intra = intra + (c_feat - c_center).pow(2).sum(dim=1).mean()
+            valid_class_count += 1
+
+        if valid_class_count == 0:
+            return torch.tensor(0.0, device=self.device)
+        intra = intra / valid_class_count
+
+        inter = torch.tensor(0.0, device=self.device)
+        if len(centers) > 1:
+            center_tensor = torch.stack(centers, dim=0)
+            dist = torch.cdist(center_tensor, center_tensor, p=2)
+            off_diag = ~torch.eye(dist.shape[0], dtype=torch.bool, device=dist.device)
+            inter = (1.0 / (dist[off_diag] + 1e-6)).mean()
+
+        return intra + 0.1 * inter
+
+    def __call__(
+        self,
+        preds: dict[str, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]],
+        batch: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute detection loss and add PID physical regularizers when available."""
+        det_total, det_items = super().__call__(preds, batch)
+        aux = self._get_pid_aux()
+        if aux is None:
+            return det_total, det_items
+
+        loss_consist = self._physics_consistency_loss(aux, batch["img"]) if self.lambda_consist > 0 else 0.0
+        loss_align = self._physics_align_loss(aux, batch) if self.lambda_align > 0 else 0.0
+
+        if not isinstance(loss_consist, torch.Tensor):
+            loss_consist = torch.tensor(float(loss_consist), device=self.device)
+        if not isinstance(loss_align, torch.Tensor):
+            loss_align = torch.tensor(float(loss_align), device=self.device)
+
+        batch_size = batch["img"].shape[0]
+        phy_total = (self.lambda_consist * loss_consist + self.lambda_align * loss_align) * batch_size
+        return det_total + phy_total, det_items
+
+
 class v8PoseLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 pose estimation."""
 
