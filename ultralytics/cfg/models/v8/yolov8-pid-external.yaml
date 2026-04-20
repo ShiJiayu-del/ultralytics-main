@@ -1,7 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 # YOLOv8 with external PID TeVNet branch template
-# Set tev_ckpt to your PID-main TeVNet checkpoint path before training.
+# Default checkpoint points to the FLIR-trained PID-main TeVNet weight.
 
 nc: 80
 scales:
@@ -21,7 +21,7 @@ backbone:
   - [-1, 6, C2f, [512, True]]
   - [-1, 1, Conv, [1024, 3, 2]]
   - [-1, 3, C2f, [1024, True]]
-  - [-1, 1, PIDDualBranchFusion, [1024, 128, 4, 0.5, True, PAN, resnet50, imagenet, "", True]]
+  - [-1, 1, PIDDualBranchFusion, [1024, 128, 4, 0.5, True, PAN, resnet50, imagenet, "/home/user/4T_Storage/SJY/Infrared/PID-main/pretrained/TeVNet-FLIR/flir-tevnet.pth", True]]
   - [-1, 1, SPPF, [1024, 5]]
 
 head:

@@ -1,7 +1,10 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
+from __future__ import annotations
+
 import sys
 import time
+from typing import Optional
 
 import torch
 
@@ -168,9 +171,9 @@ def non_max_suppression(
 
 def apply_physical_nms(
     detections,
-    thermal_maps: torch.Tensor | None = None,
-    emissivity_maps: torch.Tensor | None = None,
-    img_tensor: torch.Tensor | None = None,
+    thermal_maps: Optional[torch.Tensor] = None,
+    emissivity_maps: Optional[torch.Tensor] = None,
+    img_tensor: Optional[torch.Tensor] = None,
     *,
     conf_thres: float = 0.25,
     pedestrian_class: int = 0,

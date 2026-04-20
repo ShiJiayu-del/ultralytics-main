@@ -1,0 +1,12 @@
+# FLIR thermal detection dataset in COCO format
+# Use with: yolo detect train data=ultralytics/cfg/datasets/flir.yaml model=...
+
+path: /home/user/4T_Storage/SJY/Infrared/datasets/flir
+train: infrared/train2017
+val: infrared/val2017
+test: infrared/val2017
+
+names:
+  0: person
+  1: bicycle
+  2: car
