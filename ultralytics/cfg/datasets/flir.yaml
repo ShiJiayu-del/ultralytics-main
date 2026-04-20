@@ -2,9 +2,9 @@
 # Use with: yolo detect train data=ultralytics/cfg/datasets/flir.yaml model=...
 
 path: /home/user/4T_Storage/SJY/Infrared/datasets/flir/infrared
-train: train2017
-val: val2017
-test: val2017
+train: images/train2017
+val: images/val2017
+test: images/val2017
 
 names:
   0: person
