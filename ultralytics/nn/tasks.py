@@ -183,7 +183,9 @@ class BaseModel(torch.nn.Module):
                 self._profile_one_layer(m, x, dt)
             x = m(x)  # run
             if hasattr(m, "latest_phy") and m.latest_phy is not None:
-                pid_aux = m.latest_phy
+                pid_aux = {
+                    k: v.detach().clone() if torch.is_tensor(v) else v for k, v in m.latest_phy.items()
+                }
             y.append(x if m.i in self.save else None)  # save output
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
@@ -1650,8 +1652,10 @@ def parse_model(d, ch, verbose=True):
         )  # get module
         for j, a in enumerate(args):
             if isinstance(a, str):
-                with contextlib.suppress(ValueError):
+                try:
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
+                except (ValueError, SyntaxError, NameError):
+                    args[j] = a
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
         if m in base_modules:
             c1, c2 = ch[f], args[0]

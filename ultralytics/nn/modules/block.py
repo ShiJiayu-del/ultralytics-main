@@ -322,7 +322,12 @@ class PIDDualBranchFusion(nn.Module):
         vis_guided = vis_feat * (1.0 + self.guide_scale * temp_grad)
         out = self.fuse(torch.cat((vis_guided, phy_feat), dim=1))
 
-        self.latest_phy = {"e": emissivity, "t": temperature, "v": env_feat, "grad": temp_grad}
+        self.latest_phy = {
+            "e": emissivity.detach().clone(),
+            "t": temperature.detach().clone(),
+            "v": env_feat.detach().clone(),
+            "grad": temp_grad.detach().clone(),
+        }
         return out
 
 
@@ -347,12 +352,13 @@ class ExternalTeVPhysicsBranch(nn.Module):
                 "External TeVNet branch requires segmentation_models_pytorch. Install it or set use_external_tevnet=False."
             ) from exc
 
+        self.input_adapter = Conv(c1, 3, k=1, s=1)
         if smp_encoder_weights in {"None", "none", "null", "NULL", ""}:
             smp_encoder_weights = None
         self.model = getattr(smp, smp_model)(
             encoder_name=smp_encoder,
             encoder_weights=smp_encoder_weights,
-            in_channels=c1,
+            in_channels=3,
             classes=2 + vnums,
         )
 
@@ -383,11 +389,22 @@ class ExternalTeVPhysicsBranch(nn.Module):
                     new_key = new_key[len(prefix) :]
             normalized[new_key] = value
 
-        missing, unexpected = self.model.load_state_dict(normalized, strict=False)
-        self._load_warnings = {"missing": missing, "unexpected": unexpected}
+        target_state = self.model.state_dict()
+        filtered = {k: v for k, v in normalized.items() if k in target_state and target_state[k].shape == v.shape}
+        missing, unexpected = self.model.load_state_dict(filtered, strict=False)
+        self._load_warnings = {"missing": missing, "unexpected": unexpected, "filtered_out": len(normalized) - len(filtered)}
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        preds = self.model(x)
+        x_proj = self.input_adapter(x)
+        orig_hw = x_proj.shape[-2:]
+        target_h = max(256, ((orig_hw[0] + 15) // 16) * 16)
+        target_w = max(256, ((orig_hw[1] + 15) // 16) * 16)
+        if (target_h, target_w) != orig_hw:
+            x_proj = F.interpolate(x_proj, size=(target_h, target_w), mode="bilinear", align_corners=False)
+
+        preds = self.model(x_proj)
+        if preds.shape[-2:] != orig_hw:
+            preds = F.interpolate(preds, size=orig_hw, mode="bilinear", align_corners=False)
         preds[:, 0:1] = preds[:, 0:1].sigmoid()
         preds[:, 1:2] = preds[:, 1:2].relu()
         return preds
