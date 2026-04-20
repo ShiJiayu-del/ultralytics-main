@@ -406,6 +406,7 @@ class BaseTrainer:
             if RANK in {-1, 0}:
                 LOGGER.info(self.progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
+            text_log_interval = 10
             self.tloss = None
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
@@ -491,6 +492,15 @@ class BaseTrainer:
                             batch["img"].shape[-1],  # imgsz, i.e 640
                         )
                     )
+                    # Emit plain text logs periodically so progress is visible even when tqdm redraw is buffered.
+                    if (i + 1) % text_log_interval == 0 or (i + 1) == nb:
+                        loss_vals = self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)
+                        loss_msg = " ".join(f"l{j}:{float(v):.4f}" for j, v in enumerate(loss_vals))
+                        lr0 = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 0.0
+                        LOGGER.info(
+                            f"train epoch {epoch + 1}/{self.epochs} iter {i + 1}/{nb} "
+                            f"mem:{self._get_memory():.3g}G lr:{lr0:.6f} {loss_msg}"
+                        )
                     self.run_callbacks("on_batch_end")
                     if self.args.plots and ni in self.plot_idx:
                         self.plot_training_samples(batch, ni)

@@ -765,7 +765,7 @@ class PIDPhysicsDetectionLoss(v8DetectionLoss):
 
         inter = torch.tensor(0.0, device=self.device)
         if len(centers) > 1:
-            center_tensor = torch.stack(centers, dim=0)
+            center_tensor = torch.stack(centers, dim=0).float()
             dist = torch.cdist(center_tensor, center_tensor, p=2)
             off_diag = ~torch.eye(dist.shape[0], dtype=torch.bool, device=dist.device)
             inter = (1.0 / (dist[off_diag] + 1e-6)).mean()
