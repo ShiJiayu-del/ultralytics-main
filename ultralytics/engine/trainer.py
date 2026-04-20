@@ -405,8 +405,13 @@ class BaseTrainer:
 
             if RANK in {-1, 0}:
                 LOGGER.info(self.progress_string())
-                pbar = TQDM(enumerate(self.train_loader), total=nb)
-            text_log_interval = max(int(os.getenv("YOLO_TEXT_LOG_INTERVAL", "0")), 0)
+                disable_tqdm = os.getenv("YOLO_DISABLE_TQDM", "0").lower() in {"1", "true", "yes", "on"}
+                if not disable_tqdm:
+                    pbar = TQDM(enumerate(self.train_loader), total=nb)
+            else:
+                disable_tqdm = False
+            text_log_interval_default = "10" if disable_tqdm else "0"
+            text_log_interval = max(int(os.getenv("YOLO_TEXT_LOG_INTERVAL", text_log_interval_default)), 0)
             self.tloss = None
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
@@ -482,16 +487,17 @@ class BaseTrainer:
                 # Log
                 if RANK in {-1, 0}:
                     loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
-                    pbar.set_description(
-                        ("%11s" * 2 + "%11.4g" * (2 + loss_length))
-                        % (
-                            f"{epoch + 1}/{self.epochs}",
-                            f"{self._get_memory():.3g}G",  # (GB) GPU memory util
-                            *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
-                            batch["cls"].shape[0],  # batch size, i.e. 8
-                            batch["img"].shape[-1],  # imgsz, i.e 640
+                    if not disable_tqdm:
+                        pbar.set_description(
+                            ("%11s" * 2 + "%11.4g" * (2 + loss_length))
+                            % (
+                                f"{epoch + 1}/{self.epochs}",
+                                f"{self._get_memory():.3g}G",  # (GB) GPU memory util
+                                *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
+                                batch["cls"].shape[0],  # batch size, i.e 8
+                                batch["img"].shape[-1],  # imgsz, i.e 640
+                            )
                         )
-                    )
                     # Optional plain text logs for non-interactive terminals. Disabled by default.
                     if text_log_interval and ((i + 1) % text_log_interval == 0 or (i + 1) == nb):
                         loss_vals = self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)
