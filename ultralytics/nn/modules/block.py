@@ -3,10 +3,11 @@
 
 from __future__ import annotations
 
+import importlib
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import importlib
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
@@ -392,7 +393,11 @@ class ExternalTeVPhysicsBranch(nn.Module):
         target_state = self.model.state_dict()
         filtered = {k: v for k, v in normalized.items() if k in target_state and target_state[k].shape == v.shape}
         missing, unexpected = self.model.load_state_dict(filtered, strict=False)
-        self._load_warnings = {"missing": missing, "unexpected": unexpected, "filtered_out": len(normalized) - len(filtered)}
+        self._load_warnings = {
+            "missing": missing,
+            "unexpected": unexpected,
+            "filtered_out": len(normalized) - len(filtered),
+        }
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_proj = self.input_adapter(x)

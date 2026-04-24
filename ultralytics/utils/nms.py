@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import sys
 import time
-from typing import Optional
 
 import torch
 
@@ -171,9 +170,9 @@ def non_max_suppression(
 
 def apply_physical_nms(
     detections,
-    thermal_maps: Optional[torch.Tensor] = None,
-    emissivity_maps: Optional[torch.Tensor] = None,
-    img_tensor: Optional[torch.Tensor] = None,
+    thermal_maps: torch.Tensor | None = None,
+    emissivity_maps: torch.Tensor | None = None,
+    img_tensor: torch.Tensor | None = None,
     *,
     conf_thres: float = 0.25,
     pedestrian_class: int = 0,
@@ -187,7 +186,6 @@ def apply_physical_nms(
 
     This function expects detections in xyxy + conf + cls format per image.
     """
-
     if thermal_maps is None and img_tensor is None:
         return detections
 
@@ -222,7 +220,7 @@ def apply_physical_nms(
         bg_temp = t_map.mean()
         kept_rows = []
         for row in det:
-            x1, y1, x2, y2, conf, cls_id = row[:6]
+            x1, y1, x2, y2, _conf, cls_id = row[:6]
             ix1 = max(0, min(int(torch.floor(x1).item()), w - 1))
             iy1 = max(0, min(int(torch.floor(y1).item()), h - 1))
             ix2 = max(ix1 + 1, min(int(torch.ceil(x2).item()), w))

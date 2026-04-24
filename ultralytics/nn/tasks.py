@@ -55,9 +55,9 @@ from ultralytics.nn.modules import (
     ImagePoolingAttn,
     Index,
     LRPCHead,
+    PIDDualBranchFusion,
     Pose,
     Pose26,
-    PIDDualBranchFusion,
     RepC3,
     RepConv,
     RepNCSPELAN4,
@@ -78,8 +78,8 @@ from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, WINDOWS, YAML, colorstr,
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
     E2ELoss,
-    PoseLoss26,
     PIDPhysicsDetectionLoss,
+    PoseLoss26,
     v8ClassificationLoss,
     v8DetectionLoss,
     v8OBBLoss,
@@ -183,9 +183,7 @@ class BaseModel(torch.nn.Module):
                 self._profile_one_layer(m, x, dt)
             x = m(x)  # run
             if hasattr(m, "latest_phy") and m.latest_phy is not None:
-                pid_aux = {
-                    k: v.detach().clone() if torch.is_tensor(v) else v for k, v in m.latest_phy.items()
-                }
+                pid_aux = {k: v.detach().clone() if torch.is_tensor(v) else v for k, v in m.latest_phy.items()}
             y.append(x if m.i in self.save else None)  # save output
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
