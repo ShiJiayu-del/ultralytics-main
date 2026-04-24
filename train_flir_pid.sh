@@ -32,9 +32,9 @@ echo "[train_flir_pid] env=$ENV_NAME gpu=$CUDA_VISIBLE_DEVICES_VALUE"
 echo "[train_flir_pid] model=$MODEL data=$DATA epochs=$EPOCHS batch=$BATCH device=$DEVICE workers=$WORKERS"
 
 CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES_VALUE" \
-YOLO_DISABLE_TQDM="$YOLO_DISABLE_TQDM" \
-YOLO_TEXT_LOG_INTERVAL="$YOLO_TEXT_LOG_INTERVAL" \
-conda run --no-capture-output -n "$ENV_NAME" \
+  YOLO_DISABLE_TQDM="$YOLO_DISABLE_TQDM" \
+  YOLO_TEXT_LOG_INTERVAL="$YOLO_TEXT_LOG_INTERVAL" \
+  conda run --no-capture-output -n "$ENV_NAME" \
   yolo detect train \
   model="$MODEL" \
   data="$DATA" \
