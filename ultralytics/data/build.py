@@ -17,7 +17,7 @@ from PIL import Image
 from torch.utils.data import Dataset, dataloader, distributed
 
 from ultralytics.cfg import IterableSimpleNamespace
-from ultralytics.data.dataset import GroundingDataset, YOLODataset, YOLOMultiModalDataset
+from ultralytics.data.dataset import GroundingDataset, PairedRGBIRDataset, YOLODataset, YOLOMultiModalDataset
 from ultralytics.data.loaders import (
     LOADERS,
     LoadImagesAndVideos,
@@ -230,10 +230,14 @@ def build_yolo_dataset(
     rect: bool = False,
     stride: int = 32,
     multi_modal: bool = False,
+    rgbir: bool = False,
 ) -> Dataset:
     """Build and return a YOLO dataset based on configuration parameters."""
-    dataset = YOLOMultiModalDataset if multi_modal else YOLODataset
-    return dataset(
+    if rgbir:
+        dataset = PairedRGBIRDataset
+    else:
+        dataset = YOLOMultiModalDataset if multi_modal else YOLODataset
+    kwargs = dict(
         img_path=img_path,
         imgsz=cfg.imgsz,
         batch_size=batch,
@@ -250,6 +254,9 @@ def build_yolo_dataset(
         data=data,
         fraction=cfg.fraction if mode == "train" else 1.0,
     )
+    if rgbir:
+        kwargs["rgb_path"] = data.get(f"{mode}_rgb") or data.get("rgb")
+    return dataset(**kwargs)
 
 
 def build_grounding(

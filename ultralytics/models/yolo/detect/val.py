@@ -16,6 +16,7 @@ from ultralytics.utils import LOGGER, RANK, nms, ops
 from ultralytics.utils.checks import check_requirements
 from ultralytics.utils.metrics import ConfusionMatrix, DetMetrics, box_iou
 from ultralytics.utils.plotting import plot_images
+from ultralytics.utils.torch_utils import unwrap_model
 
 
 class DetectionValidator(BaseValidator):
@@ -73,6 +74,8 @@ class DetectionValidator(BaseValidator):
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
         batch["img"] = (batch["img"].half() if self.args.half else batch["img"].float()) / 255
+        if "ir_img" in batch:
+            batch["ir_img"] = (batch["ir_img"].half() if self.args.half else batch["ir_img"].float()) / 255
         return batch
 
     def init_metrics(self, model: torch.nn.Module) -> None:
@@ -316,7 +319,10 @@ class DetectionValidator(BaseValidator):
         Returns:
             (Dataset): YOLO dataset.
         """
-        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, stride=self.stride)
+        rgbir = bool(getattr(self.args, "rgbir", False))
+        if not rgbir and hasattr(self, "model"):
+            rgbir = bool(getattr(unwrap_model(self.model), "is_rgbir", False))
+        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, stride=self.stride, rgbir=rgbir)
 
     def get_dataloader(self, dataset_path: str, batch_size: int) -> torch.utils.data.DataLoader:
         """Construct and return dataloader.

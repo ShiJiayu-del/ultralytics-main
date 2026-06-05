@@ -514,6 +514,221 @@ class DetectionModel(BaseModel):
         return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
 
 
+class RGBIRConcatDetectionModel(BaseModel):
+    """YOLOv8 RGB-IR dual-branch detection model with P3/P4/P5 concat fusion."""
+
+    def __init__(self, cfg="yolov8l.yaml", ch=3, nc=None, verbose=True):
+        super().__init__()
+        self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)
+        if self.yaml["backbone"][0][2] == "Silence":
+            LOGGER.warning(
+                "YOLOv9 `Silence` module is deprecated in favor of torch.nn.Identity. "
+                "Please delete local *.pt file and re-download the latest model checkpoint."
+            )
+            self.yaml["backbone"][0][2] = "nn.Identity"
+
+        self.yaml["channels"] = ch
+        if nc and nc != self.yaml["nc"]:
+            LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
+            self.yaml["nc"] = nc
+
+        full_model, _ = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)
+        self.backbone_len = len(self.yaml["backbone"])
+        self.rgb_backbone = deepcopy(nn.Sequential(*full_model[: self.backbone_len]))
+        self.ir_backbone = deepcopy(nn.Sequential(*full_model[: self.backbone_len]))
+        self.neck_head = nn.Sequential(*deepcopy(full_model[self.backbone_len :]))
+        self.model = self.neck_head  # compatibility for head access and criterion
+        self.neck_head_indices = [m.i for m in self.neck_head]
+        self.detect_neck_local_idx = next((i for i, m in enumerate(self.neck_head) if isinstance(m, Detect)), -1)
+
+        # YOLOv8 backbone outputs used by neck: P3(4), P4(6), P5(9)
+        self.p3_idx, self.p4_idx, self.p5_idx = 4, 6, 9
+
+        with torch.no_grad():
+            y = self._forward_backbone(self.rgb_backbone, torch.zeros(1, ch, 64, 64))
+            c3, c4, c5 = y[self.p3_idx].shape[1], y[self.p4_idx].shape[1], y[self.p5_idx].shape[1]
+        self.fuse_p3 = nn.Conv2d(c3 * 2, c3, kernel_size=1, stride=1, padding=0, bias=True)
+        self.fuse_p4 = nn.Conv2d(c4 * 2, c4, kernel_size=1, stride=1, padding=0, bias=True)
+        self.fuse_p5 = nn.Conv2d(c5 * 2, c5, kernel_size=1, stride=1, padding=0, bias=True)
+
+        self.names = {i: f"{i}" for i in range(self.yaml["nc"])}
+        self.inplace = self.yaml.get("inplace", True)
+        self.is_rgbir = True
+        self._shape_logged = False
+
+        m = self.neck_head[-1]
+        if isinstance(m, Detect):
+            s = 256
+            m.inplace = self.inplace
+
+            def _forward(x):
+                output = self.forward((x, x))
+                if self.end2end:
+                    output = output["one2many"]
+                return output["feats"]
+
+            self.eval()
+            m.training = True
+            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])
+            self.stride = m.stride
+            self.train()
+            m.bias_init()
+        else:
+            self.stride = torch.Tensor([32])
+
+        initialize_weights(self)
+        if verbose:
+            self.info()
+            LOGGER.info("")
+
+    @property
+    def end2end(self):
+        """Return whether the model uses end-to-end NMS-free detection."""
+        return getattr(self.neck_head[-1], "end2end", False)
+
+    @end2end.setter
+    def end2end(self, value):
+        """Override the end-to-end detection mode."""
+        self.set_head_attr(end2end=value)
+
+    def set_head_attr(self, **kwargs):
+        """Set attributes of the model head (last layer)."""
+        head = self.neck_head[-1]
+        for k, v in kwargs.items():
+            if not hasattr(head, k):
+                LOGGER.warning(f"Head has no attribute '{k}'.")
+                continue
+            setattr(head, k, v)
+
+    def warmup(self, imgsz=(1, 3, 640, 640), *args, **kwargs):
+        """Warm up RGB-IR model with paired dummy inputs."""
+        if not torch.cuda.is_available() and next(self.parameters()).device.type == "cpu":
+            return
+        p = next(self.parameters())
+        im = torch.empty(*imgsz, dtype=p.dtype, device=p.device)
+        self.forward((im, im), *args, **kwargs)
+
+    @staticmethod
+    def _forward_backbone(backbone: nn.Sequential, x: torch.Tensor) -> dict:
+        """Forward one backbone and return indexed intermediate outputs."""
+        y = {}
+        for m in backbone:
+            if m.f != -1:
+                x_in = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+            else:
+                x_in = x
+            x = m(x_in)
+            y[m.i] = x
+        return y
+
+    def _forward_neck_head(self, p3: torch.Tensor, p4: torch.Tensor, p5: torch.Tensor) -> torch.Tensor:
+        """Forward the shared neck+head using fused P3/P4/P5 features."""
+        y = {self.p3_idx: p3, self.p4_idx: p4, self.p5_idx: p5}
+        x = p5
+        for m in self.neck_head:
+            if m.f != -1:
+                if isinstance(m.f, int):
+                    x = y[m.f]
+                else:
+                    x = [x if j == -1 else y[j] for j in m.f]
+            x = m(x)
+            y[m.i] = x
+        return x
+
+    def predict(self, x, profile=False, visualize=False, augment=False, embed=None):
+        """Run dual-input inference."""
+        if augment:
+            LOGGER.warning("RGBIRConcatDetectionModel does not support 'augment=True'. Reverting to single-scale.")
+        if isinstance(x, (tuple, list)) and len(x) == 2:
+            rgb, ir = x
+        elif isinstance(x, dict):
+            rgb, ir = x["img"], x["ir_img"]
+        else:
+            raise ValueError("RGBIRConcatDetectionModel expects input as (rgb, ir) or dict with 'img' and 'ir_img'.")
+
+        y_rgb = self._forward_backbone(self.rgb_backbone, rgb)
+        y_ir = self._forward_backbone(self.ir_backbone, ir)
+
+        p3_rgb, p4_rgb, p5_rgb = y_rgb[self.p3_idx], y_rgb[self.p4_idx], y_rgb[self.p5_idx]
+        p3_ir, p4_ir, p5_ir = y_ir[self.p3_idx], y_ir[self.p4_idx], y_ir[self.p5_idx]
+        if p3_rgb.shape[-2:] != p3_ir.shape[-2:] or p4_rgb.shape[-2:] != p4_ir.shape[-2:] or p5_rgb.shape[-2:] != p5_ir.shape[-2:]:
+            raise RuntimeError("RGB and IR feature map shapes are inconsistent at P3/P4/P5.")
+
+        p3_cat = torch.cat((p3_rgb, p3_ir), dim=1)
+        p4_cat = torch.cat((p4_rgb, p4_ir), dim=1)
+        p5_cat = torch.cat((p5_rgb, p5_ir), dim=1)
+        p3 = self.fuse_p3(p3_cat)
+        p4 = self.fuse_p4(p4_cat)
+        p5 = self.fuse_p5(p5_cat)
+        if not self._shape_logged:
+            LOGGER.info(
+                "RGBIR fusion shapes: "
+                f"P3 rgb={tuple(p3_rgb.shape)}, ir={tuple(p3_ir.shape)}, cat={tuple(p3_cat.shape)}, out={tuple(p3.shape)}; "
+                f"P4 rgb={tuple(p4_rgb.shape)}, ir={tuple(p4_ir.shape)}, cat={tuple(p4_cat.shape)}, out={tuple(p4.shape)}; "
+                f"P5 rgb={tuple(p5_rgb.shape)}, ir={tuple(p5_ir.shape)}, cat={tuple(p5_cat.shape)}, out={tuple(p5.shape)}"
+            )
+            self._shape_logged = True
+        return self._forward_neck_head(p3, p4, p5)
+
+    def loss(self, batch, preds=None):
+        """Compute detection loss for dual-input batch."""
+        if getattr(self, "criterion", None) is None:
+            self.criterion = self.init_criterion()
+        if preds is None:
+            preds = self.predict((batch["img"], batch["ir_img"]))
+        return self.criterion(preds, batch)
+
+    def init_criterion(self):
+        """Initialize the loss criterion for dual-branch detection."""
+        return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+
+    def load(self, weights, verbose=True):
+        """Load pretrained weights: copy backbone to RGB+IR branches, load neck, reinit fusion+head."""
+        model = weights["model"] if isinstance(weights, dict) else weights
+        csd = model.float().state_dict()
+        sd = self.state_dict()
+        updates = {}
+        loaded = {"rgb_backbone": 0, "ir_backbone": 0, "neck": 0}
+        missed = {"rgb_backbone": 0, "ir_backbone": 0, "neck": 0}
+
+        for k in sd.keys():
+            mapped = None
+            group = None
+            if k.startswith("rgb_backbone."):
+                mapped = f"model.{k[len('rgb_backbone.'):]}"
+                group = "rgb_backbone"
+            elif k.startswith("ir_backbone."):
+                mapped = f"model.{k[len('ir_backbone.'):]}"
+                group = "ir_backbone"
+            elif k.startswith("neck_head."):
+                suffix = k[len("neck_head.") :]
+                local_idx_str, _, tail = suffix.partition(".")
+                local_idx = int(local_idx_str)
+                if local_idx == self.detect_neck_local_idx:
+                    continue  # detection head is intentionally reinitialized
+                orig_idx = self.neck_head_indices[local_idx]
+                mapped = f"model.{orig_idx}.{tail}" if tail else f"model.{orig_idx}"
+                group = "neck"
+            if mapped and mapped in csd and csd[mapped].shape == sd[k].shape:
+                updates[k] = csd[mapped]
+                loaded[group] += 1
+            elif group:
+                missed[group] += 1
+
+        self.load_state_dict(updates, strict=False)
+        if verbose:
+            LOGGER.info(
+                "RGBIR weight loading summary: "
+                f"RGB backbone loaded={loaded['rgb_backbone']}, missed={missed['rgb_backbone']}; "
+                f"IR backbone loaded={loaded['ir_backbone']}, missed={missed['ir_backbone']}; "
+                f"Neck loaded={loaded['neck']}, missed={missed['neck']}."
+            )
+            LOGGER.info(
+                "Reinitialized modules: "
+                "Detect head (class count adapted), fuse_p3(1x1), fuse_p4(1x1), fuse_p5(1x1)."
+            )
+
+
 class OBBModel(DetectionModel):
     """YOLO Oriented Bounding Box (OBB) model.
 

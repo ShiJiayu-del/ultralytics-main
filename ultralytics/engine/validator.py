@@ -209,6 +209,8 @@ class BaseValidator:
             model.warmup(imgsz=(1 if pt else self.args.batch, self.data["channels"], imgsz, imgsz))  # warmup
 
         self.run_callbacks("on_val_start")
+        self.model = model
+        self.args.rgbir = bool(getattr(unwrap_model(model), "is_rgbir", False))
         dt = (
             Profile(device=self.device),
             Profile(device=self.device),
@@ -227,7 +229,10 @@ class BaseValidator:
 
             # Inference
             with dt[1]:
-                preds = model(batch["img"], augment=augment)
+                if "ir_img" in batch and getattr(self.args, "rgbir", False):
+                    preds = model((batch["img"], batch["ir_img"]), augment=augment)
+                else:
+                    preds = model(batch["img"], augment=augment)
 
             # Loss
             with dt[2]:

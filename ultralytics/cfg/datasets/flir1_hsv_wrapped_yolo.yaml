@@ -1,0 +1,7 @@
+path: /home/user/4T_Storage/SJY/Infrared/datasets/Detection/flir1_hsv_yolo
+train: images/train2017
+val: images/val2017
+names:
+  0: person
+  1: bicycle
+  2: car

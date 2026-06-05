@@ -14,7 +14,7 @@ import torch.nn as nn
 from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models import yolo
-from ultralytics.nn.tasks import DetectionModel
+from ultralytics.nn.tasks import DetectionModel, RGBIRConcatDetectionModel, yaml_model_load
 from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK
 from ultralytics.utils.patches import override_configs
 from ultralytics.utils.plotting import plot_images, plot_labels
@@ -74,7 +74,10 @@ class DetectionTrainer(BaseTrainer):
             (Dataset): YOLO dataset object configured for the specified mode.
         """
         gs = max(int(unwrap_model(self.model).stride.max()), 32)
-        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)
+        rgbir = bool(getattr(unwrap_model(self.model), "is_rgbir", False))
+        return build_yolo_dataset(
+            self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs, rgbir=rgbir
+        )
 
     def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0, mode: str = "train"):
         """Construct and return dataloader for the specified mode.
@@ -117,6 +120,8 @@ class DetectionTrainer(BaseTrainer):
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
         batch["img"] = batch["img"].float() / 255
+        if "ir_img" in batch:
+            batch["ir_img"] = batch["ir_img"].float() / 255
         if self.args.multi_scale > 0.0:
             imgs = batch["img"]
             sz = (
@@ -133,6 +138,10 @@ class DetectionTrainer(BaseTrainer):
                     math.ceil(x * sf / self.stride) * self.stride for x in imgs.shape[2:]
                 ]  # new shape (stretched to gs-multiple)
                 imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
+                if "ir_img" in batch:
+                    batch["ir_img"] = nn.functional.interpolate(
+                        batch["ir_img"], size=ns, mode="bilinear", align_corners=False
+                    )
             batch["img"] = imgs
         return batch
 
@@ -178,7 +187,10 @@ class DetectionTrainer(BaseTrainer):
         Returns:
             (DetectionModel): YOLO detection model.
         """
-        model = DetectionModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        yaml_cfg = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)
+        dual_rgbir = bool(yaml_cfg.get("rgbir_dual", False))
+        model_cls = RGBIRConcatDetectionModel if dual_rgbir else DetectionModel
+        model = model_cls(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
         if weights:
             model.load(weights)
         return model

@@ -218,7 +218,10 @@ def select_device(device="", newline=False, verbose=True):
         if "," in device:
             device = ",".join([x for x in device.split(",") if x])  # remove sequential commas, i.e. "0,,1" -> "0,1"
         visible = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-        os.environ["CUDA_VISIBLE_DEVICES"] = device  # set environment variable - must be before assert is_available()
+        # Respect an externally pinned CUDA_VISIBLE_DEVICES, e.g. physical GPUs 2,3 are exposed as local 0,1.
+        # Overwriting it here would silently move training back to physical GPUs 0,1.
+        if visible is None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = device  # set environment variable - must be before assert is_available()
         if not (torch.cuda.is_available() and torch.cuda.device_count() >= len(device.split(","))):
             LOGGER.info(s)
             install = (

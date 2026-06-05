@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from collections import defaultdict
 from itertools import repeat
 from multiprocessing.pool import ThreadPool
@@ -294,7 +295,7 @@ class YOLODataset(BaseDataset):
         values = list(zip(*[list(b.values()) for b in batch]))
         for i, k in enumerate(keys):
             value = values[i]
-            if k in {"img", "text_feats", "sem_masks"}:
+            if k in {"img", "ir_img", "text_feats", "sem_masks"}:
                 value = torch.stack(value, 0)
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
@@ -306,6 +307,270 @@ class YOLODataset(BaseDataset):
             new_batch["batch_idx"][i] += i  # add target image index for build_targets()
         new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
         return new_batch
+
+
+class PairedRGBIRDataset(YOLODataset):
+    """YOLO dataset that loads paired RGB and IR images with shared detection labels."""
+
+    def __init__(self, *args, rgb_path: str | list[str] | None = None, **kwargs):
+        self.rgb_path = rgb_path
+        super().__init__(*args, **kwargs)
+
+    def get_img_files(self, img_path: str | list[str]) -> list[str]:
+        """Load IR image files only. Expected IR naming: `ir_xxxxx.*`."""
+        files = super().get_img_files(img_path)
+        ir_files = [f for f in files if Path(f).stem.startswith("ir_")]
+        if not ir_files:
+            raise FileNotFoundError(f"{self.prefix}No IR images found under {img_path}. Expected names like 'ir_00001.png'.")
+        return ir_files
+
+    def _class_map(self) -> dict[str, int]:
+        """Return class-name to class-index mapping from data.yaml names."""
+        names = self.data.get("names", {})
+        items = names.items() if isinstance(names, dict) else enumerate(names)
+        cls_map = {str(v).lower(): int(k) for k, v in items}
+        for k, v in list(cls_map.items()):
+            cls_map[k.replace(" ", "_").replace("-", "_")] = v
+        if "feright_car" in cls_map:
+            cls_map.setdefault("feright car", cls_map["feright_car"])
+            cls_map.setdefault("feright", cls_map["feright_car"])
+            cls_map.setdefault("freight_car", cls_map["feright_car"])
+            cls_map.setdefault("freight car", cls_map["feright_car"])
+            cls_map.setdefault("freight", cls_map["feright_car"])
+        return cls_map
+
+    def _map_label_path(self, im_file: str) -> str:
+        """Map an IR image path to its YOLO txt label path."""
+        p = Path(im_file)
+        parts = list(p.parts)
+        mapped = None
+        for i, part in enumerate(parts):
+            if part == "ir_images":
+                label_root = Path(*parts[:i], "labels")
+                rel = Path(*parts[i + 1 :]).with_suffix(".txt")
+                mapped = label_root / rel
+                break
+            if part.endswith("_images"):
+                label_root = Path(*parts[:i], part.replace("_images", "_labels"))
+                rel = Path(*parts[i + 1 :]).with_suffix(".txt")
+                candidates = [label_root / rel]
+                if rel.parts and rel.parts[0] == "png_images":
+                    candidates.append(label_root / Path(*rel.parts[1:]))
+                for c in candidates:
+                    if c.exists():
+                        mapped = c
+                        break
+                if mapped is None:
+                    mapped = candidates[-1]
+                break
+            if part == "images":
+                label_root = Path(*parts[:i], "labels")
+                rel = Path(*parts[i + 1 :]).with_suffix(".txt")
+                mapped = label_root / rel
+                break
+        if mapped is None:
+            mapped = p.with_suffix(".txt")
+        return str(mapped)
+
+    def cache_labels(self, path: Path = Path("./labels.rgbir.cache")) -> dict:
+        """Cache paired RGB-IR labels, converting DroneVehicle quadrilateral labels to YOLO xywh."""
+        x = {"labels": []}
+        nm, nf, ne, nc, msgs = 0, 0, 0, 0, []
+        cls_map = self._class_map()
+        desc = f"{self.prefix}Scanning {path.parent / path.stem}..."
+
+        pbar = TQDM(zip(self.im_files, self.label_files), desc=desc, total=len(self.im_files))
+        for im_file, lb_file in pbar:
+            try:
+                with Image.open(im_file) as im:
+                    w, h = im.size
+                boxes = []
+                if Path(lb_file).exists():
+                    with open(lb_file, encoding="utf-8") as f:
+                        lines = [line.strip().split() for line in f if line.strip()]
+                    if lines:
+                        nf += 1
+                    else:
+                        ne += 1
+                    for line in lines:
+                        if len(line) == 5:
+                            try:
+                                cls_idx = int(float(line[0])) if line[0].replace(".", "", 1).isdigit() else cls_map[line[0].lower()]
+                                xywh = [float(v) for v in line[1:5]]
+                            except (KeyError, ValueError):
+                                msgs.append(f"{self.prefix}{im_file}: ignoring malformed YOLO label line: {' '.join(line)}")
+                                continue
+                            if cls_idx < 0 or cls_idx >= len(self.data["names"]):
+                                msgs.append(f"{self.prefix}{im_file}: class index {cls_idx} out of range")
+                                continue
+                            if any(v < 0 or v > 1 for v in xywh) or xywh[2] <= 0 or xywh[3] <= 0:
+                                msgs.append(f"{self.prefix}{im_file}: ignoring invalid normalized YOLO box: {' '.join(line)}")
+                                continue
+                            boxes.append([cls_idx, *xywh])
+                            continue
+                        if len(line) < 9:
+                            msgs.append(f"{self.prefix}{im_file}: ignoring malformed label line: {' '.join(line)}")
+                            continue
+                        coords = np.array([float(v) for v in line[:8]], dtype=np.float32).reshape(4, 2)
+                        cls_name = line[8].lower()
+                        if cls_name not in cls_map:
+                            msgs.append(f"{self.prefix}{im_file}: unknown class '{line[8]}'")
+                            continue
+                        x1, y1 = coords[:, 0].min().clip(0, w), coords[:, 1].min().clip(0, h)
+                        x2, y2 = coords[:, 0].max().clip(0, w), coords[:, 1].max().clip(0, h)
+                        bw, bh = x2 - x1, y2 - y1
+                        if bw <= 1 or bh <= 1:
+                            continue
+                        boxes.append([cls_map[cls_name], (x1 + x2) / 2 / w, (y1 + y2) / 2 / h, bw / w, bh / h])
+                else:
+                    nm += 1
+                lb = np.array(boxes, dtype=np.float32) if boxes else np.zeros((0, 5), dtype=np.float32)
+                x["labels"].append(
+                    {
+                        "im_file": im_file,
+                        "shape": (h, w),
+                        "cls": lb[:, 0:1],
+                        "bboxes": lb[:, 1:],
+                        "segments": [],
+                        "keypoints": None,
+                        "normalized": True,
+                        "bbox_format": "xywh",
+                    }
+                )
+            except Exception as e:
+                nc += 1
+                msgs.append(f"{self.prefix}{im_file}: ignoring corrupt image/label: {e}")
+            pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
+        pbar.close()
+
+        if msgs:
+            LOGGER.info("\n".join(msgs[:50]))
+            if len(msgs) > 50:
+                LOGGER.info(f"{self.prefix}{len(msgs) - 50} additional label messages suppressed")
+        if nf == 0:
+            LOGGER.warning(f"{self.prefix}No labels found in {path}. {HELP_URL}")
+        x["hash"] = get_hash(self.label_files + self.im_files)
+        x["results"] = nf, nm, ne, nc, len(self.im_files)
+        x["msgs"] = msgs
+        if x["labels"]:
+            save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
+        return x
+
+    def get_labels(self) -> list[dict]:
+        """Return list of label dictionaries using custom IR-image to label mapping."""
+        self.label_files = [self._map_label_path(f) for f in self.im_files]
+        cache_path = Path(self.label_files[0]).parent.with_suffix(".rgbir.cache")
+        try:
+            cache, exists = load_dataset_cache_file(cache_path), True
+            assert cache["version"] == DATASET_CACHE_VERSION
+            assert cache["hash"] == get_hash(self.label_files + self.im_files)
+        except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
+            cache, exists = self.cache_labels(cache_path), False
+
+        nf, nm, ne, nc, n = cache.pop("results")
+        if exists and LOCAL_RANK in {-1, 0}:
+            d = f"Scanning {cache_path}... {nf} images, {nm + ne} backgrounds, {nc} corrupt"
+            TQDM(None, desc=self.prefix + d, total=n, initial=n)
+            if cache["msgs"]:
+                LOGGER.info("\n".join(cache["msgs"]))
+
+        labels = cache["labels"]
+        if not labels:
+            issues = "\n  ".join(sorted(set(cache["msgs"]))) or "no error details"
+            raise RuntimeError(f"No valid images found in {cache_path}.\n  {issues}\n{HELP_URL}")
+        [cache.pop(k) for k in ("hash", "version", "msgs")]
+        self.im_files = [lb["im_file"] for lb in labels]
+
+        lengths = ((len(lb["cls"]), len(lb["bboxes"]), len(lb["segments"])) for lb in labels)
+        len_cls, len_boxes, len_segments = (sum(x) for x in zip(*lengths))
+        if len_segments and len_boxes != len_segments:
+            LOGGER.warning(
+                f"Box and segment counts should be equal, but got len(segments) = {len_segments}, "
+                f"len(boxes) = {len_boxes}. Segments will be removed."
+            )
+            for lb in labels:
+                lb["segments"] = []
+        if len_cls == 0:
+            LOGGER.warning(f"Labels are missing or empty in {cache_path}, training may not work correctly. {HELP_URL}")
+        return labels
+
+    def _resolve_rgb_path(self, ir_file: str) -> str:
+        """Resolve RGB image path from an IR image path."""
+        ir_path = Path(ir_file)
+        stem = ir_path.stem
+        base = stem[3:] if stem.startswith("ir_") else stem
+        exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
+
+        candidates = [ir_path.with_name(base + ext) for ext in exts]
+        parts = list(ir_path.parts)
+        if "ir_images" in parts:
+            i = parts.index("ir_images")
+            rgb_root = Path(*parts[:i], "images", *parts[i + 1 : -1])
+            for ext in exts:
+                candidates.append(rgb_root / f"{base}{ext}")
+
+        if self.rgb_path:
+            rgb_roots = self.rgb_path if isinstance(self.rgb_path, list) else [self.rgb_path]
+            rel_tail = ir_path.name
+            if rel_tail.startswith("ir_"):
+                rel_tail = rel_tail[3:]
+            for root in rgb_roots:
+                root = Path(root)
+                if not root.is_absolute():
+                    data_root = Path(self.data.get("path", ""))
+                    if data_root:
+                        root = data_root / root
+                for ext in exts:
+                    candidates.append(root / f"{Path(rel_tail).stem}{ext}")
+
+        for c in candidates:
+            if c.exists():
+                return str(c)
+        raise FileNotFoundError(f"Paired RGB image not found for IR image: {ir_file}")
+
+    def _load_rgb_image(self, ir_index: int, target_hw: tuple[int, int]) -> np.ndarray:
+        """Load paired RGB image and resize to target HW."""
+        rgb_path = self._resolve_rgb_path(self.im_files[ir_index])
+        rgb = cv2.imread(rgb_path, cv2.IMREAD_COLOR)
+        if rgb is None:
+            raise FileNotFoundError(f"RGB image not found or unreadable: {rgb_path}")
+        if rgb.ndim == 2:
+            rgb = cv2.cvtColor(rgb, cv2.COLOR_GRAY2BGR)
+        if rgb.shape[:2] != target_hw:
+            rgb = cv2.resize(rgb, (target_hw[1], target_hw[0]), interpolation=cv2.INTER_LINEAR)
+        return rgb
+
+    def get_image_and_label(self, index: int) -> dict[str, Any]:
+        """Load paired RGB-IR image and shared label."""
+        label = deepcopy(self.labels[index])
+        label.pop("shape", None)
+        ir_img, ori_shape, resized_shape = self.load_image(index)
+        if ir_img.ndim == 2:
+            ir_img = ir_img[..., None]
+        if ir_img.shape[2] == 1:
+            ir_img = np.repeat(ir_img, 3, axis=2)
+        rgb_img = self._load_rgb_image(index, ir_img.shape[:2])
+        label["img"] = np.concatenate((rgb_img, ir_img), axis=2)  # HWC, 6 channels
+        label["ori_shape"], label["resized_shape"] = ori_shape, resized_shape
+        label["ratio_pad"] = (
+            label["resized_shape"][0] / label["ori_shape"][0],
+            label["resized_shape"][1] / label["ori_shape"][1],
+        )
+        if self.rect:
+            label["rect_shape"] = self.batch_shapes[self.batch[index]]
+        return self.update_labels_info(label)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        """Return transformed sample split into RGB and IR tensors."""
+        sample = self.transforms(self.get_image_and_label(index))
+        img = sample["img"]
+        if img.shape[0] != 6:
+            raise RuntimeError(f"Expected 6-channel fused image tensor, got shape {tuple(img.shape)}")
+        # Format only flips BGR->RGB for 3-channel images; paired samples are 6-channel BGR+BGR.
+        img = img[[2, 1, 0, 5, 4, 3]]
+        sample["img"] = img[:3]
+        sample["ir_img"] = img[3:]
+        return sample
 
 
 class YOLOMultiModalDataset(YOLODataset):
